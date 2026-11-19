@@ -102,16 +102,117 @@ wt_clean() {
 	printf '%s' "$s"
 }
 
+# Размер окна по фактическому тексту: newt переносит только текст сообщения
+# (внутренняя ширина = ширина окна - 4), поэтому ширину берём по самой длинной
+# строке, высоту — по числу строк после переноса плюс строки списка. Подсчёт —
+# как в dietpi-globals:524-560; при нехватке места включаем --scrolltext.
+# Размер терминала: COLUMNS/LINES из окружения, иначе сам терминал, иначе 24x80.
+# В скрипте COLUMNS/LINES обычно не экспортированы, поэтому нужен путь через stty.
+wt_term() {
+	local s
+	if [[ -n ${COLUMNS:-} && -n ${LINES:-} ]]; then
+		printf '%s %s\n' "$LINES" "$COLUMNS"
+		return
+	fi
+	if s=$(stty size < /dev/tty 2>/dev/null) && [[ -n $s ]]; then
+		printf '%s\n' "$s"
+		return
+	fi
+	printf '24 80\n'
+}
+
+wt_dims() {
+	local text=$1 rows=${2:-0}
+	local cols lines
+	read -r lines cols <<< "$(wt_term)"
+	local width=40 inner wrap=0 line height maxh
+	local -a parts=()
+	local scroll=''
+	[[ $cols =~ ^[0-9]+$ ]] || cols=80
+	[[ $lines =~ ^[0-9]+$ ]] || lines=24
+	mapfile -t parts <<< "$text"
+	for line in "${parts[@]}"; do
+		if (( ${#line} > width )); then
+			width=${#line}
+		fi
+	done
+	if (( width > 120 )); then
+		width=120
+	fi
+	if (( width > cols - 2 )); then
+		width=$(( cols - 2 ))
+	fi
+	if (( width < 40 )); then
+		width=40
+	fi
+	inner=$(( width - 4 ))
+	if (( inner < 8 )); then
+		inner=8
+	fi
+	for line in "${parts[@]}"; do
+		wrap=$(( wrap + 1 + ( ${#line} - 1 ) / inner ))
+	done
+	height=$(( wrap + rows + 7 ))
+	maxh=$(( lines - 2 ))
+	if (( maxh < 12 )); then
+		maxh=12
+	fi
+	if (( height > maxh )); then
+		height=$maxh
+		scroll='--scrolltext'
+	fi
+	printf '%s %s %s\n' "$height" "$width" "$scroll"
+}
+
+# Сообщение об ошибке: размер по тексту, как у остальных диалогов
+wt_msg() {
+	local text=$1 h w scroll
+	text=$(wt_clean "$text")
+	read -r h w scroll <<< "$(wt_dims "$text" 0)"
+	if (( h < 10 )); then
+		h=10
+	fi
+	if [[ -n $scroll ]]; then
+		whiptail --title "$WHIPTAIL_TITLE" --scrolltext --msgbox "$text" "$h" "$w" 3>&1 1>&2 2>&3 || true
+	else
+		whiptail --title "$WHIPTAIL_TITLE" --msgbox "$text" "$h" "$w" 3>&1 1>&2 2>&3 || true
+	fi
+}
+
+# Файл целиком (сводка настроек): размер по экрану, прокрутка включена всегда
+wt_textbox() {
+	local file=$1 h w lines cols
+	read -r lines cols <<< "$(wt_term)"
+	[[ $lines =~ ^[0-9]+$ ]] || lines=24
+	[[ $cols =~ ^[0-9]+$ ]] || cols=80
+	h=$(( lines - 4 ))
+	w=$(( cols - 4 ))
+	if (( h < 12 )); then
+		h=12
+	fi
+	if (( w < 40 )); then
+		w=40
+	fi
+	if (( w > 120 )); then
+		w=120
+	fi
+	whiptail --title "$WHIPTAIL_TITLE" --scrolltext --textbox "$file" "$h" "$w" 3>&1 1>&2 2>&3 || true
+}
+
 # Да/нет: y или n
 ask_yn() {
 	local var=$1 text=$2 def=$3
-	local rc=0
+	local rc=0 h w scroll
+	local -a opt=()
 	text=$(wt_clean "$text")
+	read -r h w scroll <<< "$(wt_dims "$text" 0)"
 	if [[ $def == n ]]; then
-		whiptail --title "$WHIPTAIL_TITLE" --defaultno --yesno "$text" 14 78 3>&1 1>&2 2>&3 || rc=$?
-	else
-		whiptail --title "$WHIPTAIL_TITLE" --yesno "$text" 14 78 3>&1 1>&2 2>&3 || rc=$?
+		opt+=(--defaultno)
 	fi
+	if [[ -n $scroll ]]; then
+		opt+=("$scroll")
+	fi
+	whiptail --title "$WHIPTAIL_TITLE" "${opt[@]}" --yesno "$text" "$h" "$w" 3>&1 1>&2 2>&3 || rc=$?
 	if [[ $rc -eq 0 ]]; then
 		printf -v "$var" '%s' y
 	elif [[ $rc -eq 1 ]]; then
@@ -125,11 +226,15 @@ ask_yn() {
 # Число в диапазоне: неверный ввод -> msgbox с ошибкой и тот же диалог
 ask_num() {
 	local var=$1 text=$2 min=$3 max=$4 def=$5
-	local val=$def rc=0
+	local val=$def rc=0 h w scroll
 	text=$(wt_clean "$text")
+	read -r h w scroll <<< "$(wt_dims "$text" 0)"
+	if (( h < 12 )); then
+		h=12
+	fi
 	while :; do
 		rc=0
-		val=$(whiptail --title "$WHIPTAIL_TITLE" --inputbox "$text" 12 78 "$val" 3>&1 1>&2 2>&3) || rc=$?
+		val=$(whiptail --title "$WHIPTAIL_TITLE" --inputbox "$text" "$h" "$w" "$val" 3>&1 1>&2 2>&3) || rc=$?
 		if [[ $rc -ne 0 ]]; then
 			echo "Cancelled" >&2
 			exit 1
@@ -137,19 +242,43 @@ ask_num() {
 		if [[ $val =~ ^[0-9]+$ ]] && (( val >= min && val <= max )); then
 			break
 		fi
-		whiptail --title "$WHIPTAIL_TITLE" --msgbox "Invalid value: $val
-Enter a number from $min to $max" 10 78 3>&1 1>&2 2>&3 || true
+		wt_msg "Invalid value: $val
+Enter a number from $min to $max"
 	done
 	printf -v "$var" '%s' "$val"
 }
 
-# Меню: возвращает тег (номер пункта), а не текст пункта
+# Меню: возвращает тег (номер пункта), а не текст пункта.
+# newt не переносит пункты списка (хвост строки обрезается), поэтому меню с длинными
+# описаниями помечают --noitem: полная строка автора («1 MSK-IX+NSDI - …») уходит в текст
+# сообщения (там перенос по словам), а в списке остаётся только номер пункта.
 ask_menu() {
 	local var=$1 text=$2 def=$3
 	shift 3
+	local noitem=0 h w scroll rc=0 out rows=0
+	local -a items=() nio=()
+	if [[ ${1:-} == --noitem ]]; then
+		noitem=1
+		shift
+	fi
 	text=$(wt_clean "$text")
-	local out rc=0
-	out=$(whiptail --title "$WHIPTAIL_TITLE" --menu "$text" 24 78 12 --default-item "$def" "$@" 3>&1 1>&2 2>&3) || rc=$?
+	if (( noitem )); then
+		while (( $# )); do
+			text+=$'\n'"$1 $2"
+			items+=("$1" '')
+			rows=$(( rows + 1 ))
+			shift 2
+		done
+		nio+=(--noitem)
+	else
+		items=("$@")
+		rows=$(( $# / 2 ))
+	fi
+	read -r h w scroll <<< "$(wt_dims "$text" "$rows")"
+	if [[ -n $scroll ]]; then
+		nio+=("$scroll")
+	fi
+	out=$(whiptail --title "$WHIPTAIL_TITLE" "${nio[@]}" --menu "$text" "$h" "$w" "$rows" --default-item "$def" "${items[@]}" 3>&1 1>&2 2>&3) || rc=$?
 	if [[ $rc -ne 0 ]]; then
 		echo "Cancelled" >&2
 		exit 1
@@ -161,21 +290,25 @@ ask_menu() {
 ask_text() {
 	local var=$1 text=$2 def=$3 regex=${4:-} mode=${5:-}
 	text=$(wt_clean "$text")
-	local val=$def rc=0
+	local val=$def rc=0 h w scroll
+	read -r h w scroll <<< "$(wt_dims "$text" 0)"
+	if (( h < 12 )); then
+		h=12
+	fi
 	while :; do
 		rc=0
-		val=$(whiptail --title "$WHIPTAIL_TITLE" --inputbox "$text" 12 78 "$val" 3>&1 1>&2 2>&3) || rc=$?
+		val=$(whiptail --title "$WHIPTAIL_TITLE" --inputbox "$text" "$h" "$w" "$val" 3>&1 1>&2 2>&3) || rc=$?
 		if [[ $rc -ne 0 ]]; then
 			echo "Cancelled" >&2
 			exit 1
 		fi
 		if [[ -n $regex && ! $val =~ $regex ]]; then
-			whiptail --title "$WHIPTAIL_TITLE" --msgbox "Invalid value: $val" 10 78 3>&1 1>&2 2>&3 || true
+			wt_msg "Invalid value: $val"
 			continue
 		fi
 		if [[ $mode == host && -n $val ]]; then
 			if [[ -z $(getent ahostsv4 "$val") ]]; then
-				whiptail --title "$WHIPTAIL_TITLE" --msgbox "Invalid domain name: $val" 10 78 3>&1 1>&2 2>&3 || true
+				wt_msg "Invalid domain name: $val"
 				continue
 			fi
 		fi
@@ -301,7 +434,7 @@ OpenVPN/WireGuard path MTU [1280-1420]:" 1280 1420 "$MTU"
 	ask_yn OPENVPN_TCP_ENABLE 'Enable OpenVPN TCP? [y/n]:' n
 	ask_yn WIREGUARD_ENABLE 'Enable WireGuard/AmneziaWG? [y/n]:' y
 	ask_menu OPENVPN_PATCH 'Choose anti-censorship patch for OpenVPN (UDP only):
-Version choice [1-4]:' 2 \
+Version choice [1-4]:' 2 --noitem \
 		1 'None        - Do not install anti-censorship patch, or remove if already installed' \
 		2 'Random      - Recommended by default, randomly selects Strong or Error-Free' \
 		3 'Strong      - Better protocol masking' \
@@ -309,26 +442,26 @@ Version choice [1-4]:' 2 \
 	ask_yn OPENVPN_DCO 'OpenVPN DCO lowers CPU load, boosts data speeds, and only supports AES-128-GCM, AES-256-GCM and CHACHA20-POLY1305 encryption
 
 Turn on OpenVPN DCO? [y/n]:' y
-	ask_menu ANTIZAPRET_WARP $'Choose Cloudflare WARP for \001\e[1;32m\002AntiZapret VPN\001\e[0m\002 (antizapret-*) outbound traffic:\nWARP choice [1-4]:' 4 \
+	ask_menu ANTIZAPRET_WARP $'Choose Cloudflare WARP for \001\e[1;32m\002AntiZapret VPN\001\e[0m\002 (antizapret-*) outbound traffic:\nWARP choice [1-4]:' 4 --noitem \
 		1 'None    - Do not use' \
 		2 'All     - Route all AntiZapret VPN traffic (domains and IPs)' \
 		3 'Domain  - Route AntiZapret domains and config/include-warp-hosts.txt, excluding config/exclude-warp-hosts.txt' \
 		4 'Custom  - Route domains only from config/include-warp-hosts.txt, excluding config/exclude-warp-hosts.txt'
-	ask_menu VPN_WARP $'Choose Cloudflare WARP for \001\e[1;32m\002full VPN\001\e[0m\002 (vpn-*) outbound traffic:\nWARP choice [1-3]:' 2 \
+	ask_menu VPN_WARP $'Choose Cloudflare WARP for \001\e[1;32m\002full VPN\001\e[0m\002 (vpn-*) outbound traffic:\nWARP choice [1-3]:' 2 --noitem \
 		1 'None    - Do not use' \
 		2 'All     - Route all full VPN traffic (domains and IPs)' \
 		3 'Custom  - Route domains only from config/include-warp-hosts.txt, excluding config/exclude-warp-hosts.txt'
 	ask_yn WARP_PROTECTION $'Warning! WARP protection blocks \001\e[1;32m\002AntiZapret VPN\001\e[0m\002 and \001\e[1;32m\002full VPN\001\e[0m\002 traffic if WARP failed to connect!\n\nEnable WARP protection? [y/n]:' y
 	ask_text WARP_ENDPOINT 'Custom Cloudflare WARP endpoint (host:port):
 Enter empty to set default endpoint' "$WARP_ENDPOINT_DEFAULT" '^([^:]+:[0-9]+)?$'
-	ask_menu ANTIZAPRET_DNS $'Choose DNS resolvers for \001\e[1;32m\002AntiZapret VPN\001\e[0m\002 (antizapret-*):\nDNS choice [1-6]:\n\n  * - DNS resolvers support EDNS Client Subnet\n ** - Enable additional proxying and hide this server IP on some internet resources\n     Use only if this server is geolocated in Russia or problems\n     accessing some internet resources' 1 \
+	ask_menu ANTIZAPRET_DNS $'Choose DNS resolvers for \001\e[1;32m\002AntiZapret VPN\001\e[0m\002 (antizapret-*):\nDNS choice [1-6]:\n\n  * - DNS resolvers support EDNS Client Subnet\n ** - Enable additional proxying and hide this server IP on some internet resources\n     Use only if this server is geolocated in Russia or problems\n     accessing some internet resources' 1 --noitem \
 		1 'MSK-IX+NSDI      - DNS resolvers optimized for users located in Russia, recommended by default (+BI.ZONE +TransTeleCom +Cloudflare +Quad9 +ControlD +UltraDNS)' \
 		2 'Cloudflare+Quad9  - Use if default choice fails to resolve domains (+ControlD +UltraDNS)' \
 		3 'Yandex *         - Use if previous choice fails to resolve domains' \
 		4 'Google *         - Use if previous choice fails to resolve domains' \
 		5 'AdGuard *        - Use for blocking ads, trackers, malware and phishing websites' \
 		6 'GeoHide **       - More details: https://geohide.ru'
-	ask_menu VPN_DNS $'Choose DNS resolvers for \001\e[1;32m\002full VPN\001\e[0m\002 (vpn-*):\nDNS choice [1-2]:' 1 \
+	ask_menu VPN_DNS $'Choose DNS resolvers for \001\e[1;32m\002full VPN\001\e[0m\002 (vpn-*):\nDNS choice [1-2]:' 1 --noitem \
 		1 'Self-hosted        - Use previous choice for AntiZapret VPN, recommended by default' \
 		2 'Cloudflare/Custom  - Disables replacement answer from self-hosted DNS, allows custom DNS'
 	ask_yn DNS_WARP $'Answer "y" if selected DNS resolvers are blocked or unreachable\n\nRoute all DNS outbound queries via Cloudflare WARP? [y/n]:' n
@@ -689,8 +822,12 @@ if [[ $AZ_UI == whiptail ]]; then
 	SETUP_PREVIEW=$(mktemp)
 	trap 'rm -f "$SETUP_PREVIEW"' EXIT
 	write_setup_file > "$SETUP_PREVIEW"
-	whiptail --title "$WHIPTAIL_TITLE" --textbox "$SETUP_PREVIEW" 24 78 3>&1 1>&2 2>&3 || true
-	whiptail --title "$WHIPTAIL_TITLE" --yesno 'Proceed with installation?' 10 60 3>&1 1>&2 2>&3 || exit 1
+	wt_textbox "$SETUP_PREVIEW"
+	PROCEED=
+	ask_yn PROCEED 'Proceed with installation?' y
+	if [[ $PROCEED != y ]]; then
+		exit 1
+	fi
 fi
 echo 'Installation, please wait...'
 
