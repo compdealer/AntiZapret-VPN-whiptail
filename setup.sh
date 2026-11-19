@@ -122,7 +122,7 @@ wt_term() {
 }
 
 wt_dims() {
-	local text=$1 rows=${2:-0}
+	local text=$1 rows=${2:-0} minw=${3:-0}
 	local cols lines
 	read -r lines cols <<< "$(wt_term)"
 	local width=40 inner wrap=0 line height maxh
@@ -136,6 +136,9 @@ wt_dims() {
 			width=${#line}
 		fi
 	done
+	if (( minw > width )); then
+		width=$minw
+	fi
 	if (( width > 120 )); then
 		width=120
 	fi
@@ -250,31 +253,38 @@ Enter a number from $min to $max"
 
 # Меню: возвращает тег (номер пункта), а не текст пункта.
 # newt не переносит пункты списка (хвост строки обрезается), поэтому меню с длинными
-# описаниями помечают --noitem: полная строка автора («1 MSK-IX+NSDI - …») уходит в текст
-# сообщения (там перенос по словам), а в списке остаётся только номер пункта.
+# описаниями помечают --names: полная строка автора («1 MSK-IX+NSDI - …») уходит в текст
+# сообщения (там перенос по словам), а в списке под номером стоит короткое имя
+# («1  MSK-IX+NSDI») — как в апстримном plain-выводе (`echo '    1) …'`).
 ask_menu() {
 	local var=$1 text=$2 def=$3
 	shift 3
-	local noitem=0 h w scroll rc=0 out rows=0
+	local names=0 h w scroll rc=0 out rows=0 wl=0 lbl
 	local -a items=() nio=()
-	if [[ ${1:-} == --noitem ]]; then
-		noitem=1
+	if [[ ${1:-} == --names ]]; then
+		names=1
 		shift
 	fi
 	text=$(wt_clean "$text")
-	if (( noitem )); then
+	if (( names )); then
 		while (( $# )); do
 			text+=$'\n'"$1 $2"
-			items+=("$1" '')
+			lbl=${2%% - *}
+			while [[ $lbl == *' ' ]]; do
+				lbl=${lbl%' '}
+			done
+			if (( ${#lbl} + 2 > wl )); then
+				wl=$(( ${#lbl} + 2 ))
+			fi
+			items+=("$1" "$lbl")
 			rows=$(( rows + 1 ))
 			shift 2
 		done
-		nio+=(--noitem)
 	else
 		items=("$@")
 		rows=$(( $# / 2 ))
 	fi
-	read -r h w scroll <<< "$(wt_dims "$text" "$rows")"
+	read -r h w scroll <<< "$(wt_dims "$text" "$rows" "$wl")"
 	if [[ -n $scroll ]]; then
 		nio+=("$scroll")
 	fi
@@ -434,7 +444,7 @@ OpenVPN/WireGuard path MTU [1280-1420]:" 1280 1420 "$MTU"
 	ask_yn OPENVPN_TCP_ENABLE 'Enable OpenVPN TCP? [y/n]:' n
 	ask_yn WIREGUARD_ENABLE 'Enable WireGuard/AmneziaWG? [y/n]:' y
 	ask_menu OPENVPN_PATCH 'Choose anti-censorship patch for OpenVPN (UDP only):
-Version choice [1-4]:' 2 --noitem \
+Version choice [1-4]:' 2 --names \
 		1 'None        - Do not install anti-censorship patch, or remove if already installed' \
 		2 'Random      - Recommended by default, randomly selects Strong or Error-Free' \
 		3 'Strong      - Better protocol masking' \
@@ -442,26 +452,26 @@ Version choice [1-4]:' 2 --noitem \
 	ask_yn OPENVPN_DCO 'OpenVPN DCO lowers CPU load, boosts data speeds, and only supports AES-128-GCM, AES-256-GCM and CHACHA20-POLY1305 encryption
 
 Turn on OpenVPN DCO? [y/n]:' y
-	ask_menu ANTIZAPRET_WARP $'Choose Cloudflare WARP for \001\e[1;32m\002AntiZapret VPN\001\e[0m\002 (antizapret-*) outbound traffic:\nWARP choice [1-4]:' 4 --noitem \
+	ask_menu ANTIZAPRET_WARP $'Choose Cloudflare WARP for \001\e[1;32m\002AntiZapret VPN\001\e[0m\002 (antizapret-*) outbound traffic:\nWARP choice [1-4]:' 4 --names \
 		1 'None    - Do not use' \
 		2 'All     - Route all AntiZapret VPN traffic (domains and IPs)' \
 		3 'Domain  - Route AntiZapret domains and config/include-warp-hosts.txt, excluding config/exclude-warp-hosts.txt' \
 		4 'Custom  - Route domains only from config/include-warp-hosts.txt, excluding config/exclude-warp-hosts.txt'
-	ask_menu VPN_WARP $'Choose Cloudflare WARP for \001\e[1;32m\002full VPN\001\e[0m\002 (vpn-*) outbound traffic:\nWARP choice [1-3]:' 2 --noitem \
+	ask_menu VPN_WARP $'Choose Cloudflare WARP for \001\e[1;32m\002full VPN\001\e[0m\002 (vpn-*) outbound traffic:\nWARP choice [1-3]:' 2 --names \
 		1 'None    - Do not use' \
 		2 'All     - Route all full VPN traffic (domains and IPs)' \
 		3 'Custom  - Route domains only from config/include-warp-hosts.txt, excluding config/exclude-warp-hosts.txt'
 	ask_yn WARP_PROTECTION $'Warning! WARP protection blocks \001\e[1;32m\002AntiZapret VPN\001\e[0m\002 and \001\e[1;32m\002full VPN\001\e[0m\002 traffic if WARP failed to connect!\n\nEnable WARP protection? [y/n]:' y
 	ask_text WARP_ENDPOINT 'Custom Cloudflare WARP endpoint (host:port):
 Enter empty to set default endpoint' "$WARP_ENDPOINT_DEFAULT" '^([^:]+:[0-9]+)?$'
-	ask_menu ANTIZAPRET_DNS $'Choose DNS resolvers for \001\e[1;32m\002AntiZapret VPN\001\e[0m\002 (antizapret-*):\nDNS choice [1-6]:\n\n  * - DNS resolvers support EDNS Client Subnet\n ** - Enable additional proxying and hide this server IP on some internet resources\n     Use only if this server is geolocated in Russia or problems\n     accessing some internet resources' 1 --noitem \
+	ask_menu ANTIZAPRET_DNS $'Choose DNS resolvers for \001\e[1;32m\002AntiZapret VPN\001\e[0m\002 (antizapret-*):\nDNS choice [1-6]:\n\n  * - DNS resolvers support EDNS Client Subnet\n ** - Enable additional proxying and hide this server IP on some internet resources\n     Use only if this server is geolocated in Russia or problems\n     accessing some internet resources' 1 --names \
 		1 'MSK-IX+NSDI      - DNS resolvers optimized for users located in Russia, recommended by default (+BI.ZONE +TransTeleCom +Cloudflare +Quad9 +ControlD +UltraDNS)' \
 		2 'Cloudflare+Quad9  - Use if default choice fails to resolve domains (+ControlD +UltraDNS)' \
 		3 'Yandex *         - Use if previous choice fails to resolve domains' \
 		4 'Google *         - Use if previous choice fails to resolve domains' \
 		5 'AdGuard *        - Use for blocking ads, trackers, malware and phishing websites' \
 		6 'GeoHide **       - More details: https://geohide.ru'
-	ask_menu VPN_DNS $'Choose DNS resolvers for \001\e[1;32m\002full VPN\001\e[0m\002 (vpn-*):\nDNS choice [1-2]:' 1 --noitem \
+	ask_menu VPN_DNS $'Choose DNS resolvers for \001\e[1;32m\002full VPN\001\e[0m\002 (vpn-*):\nDNS choice [1-2]:' 1 --names \
 		1 'Self-hosted        - Use previous choice for AntiZapret VPN, recommended by default' \
 		2 'Cloudflare/Custom  - Disables replacement answer from self-hosted DNS, allows custom DNS'
 	ask_yn DNS_WARP $'Answer "y" if selected DNS resolvers are blocked or unreachable\n\nRoute all DNS outbound queries via Cloudflare WARP? [y/n]:' n
