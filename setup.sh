@@ -68,7 +68,7 @@ if [[ $AZ_UI == whiptail ]]; then
 		echo "whiptail not available, falling back to plain prompts"
 		AZ_UI=plain
 	fi
-	if [[ $AZ_UI == whiptail ]]; then
+	if [[ $AZ_UI == whiptail && ${QUESTIONS_ONLY:-0} != 1 ]]; then
 		whiptail --version 2>&1 | head -1 >> "$LOG"
 	fi
 fi
@@ -77,10 +77,36 @@ fi
 #    стоит в if/|| — иначе set -e убил бы установщик на Cancel (1) и ESC (255).
 WHIPTAIL_TITLE='AntiZapret VPN setup'
 
+# Терминал не умеет рисовать: явный AZ_UI -> код 2, выбранный в диалоге -> plain
+if [[ $AZ_UI == whiptail ]]; then
+	if ! whiptail --infobox '' 8 40 3>&1 1>&2 2>&3 2>/dev/null; then
+		if [[ $ui_explicit == 1 ]]; then
+			echo "AZ_UI=whiptail but whiptail cannot draw on this terminal"
+			exit 2
+		fi
+		echo "whiptail not available, falling back to plain prompts"
+		AZ_UI=plain
+	fi
+fi
+
+# Апстримные тексты размечены ANSI (SOH ... ESC[1;32m ... STX): whiptail inline-ANSI
+# не разбирает, поэтому маркеры и SGR-последовательности из текста диалога вырезаем.
+wt_clean() {
+	local s=$1
+	local rx=$'\033\\[[0-9;]*m'
+	s=${s//$'\001'/}
+	s=${s//$'\002'/}
+	while [[ $s =~ $rx ]]; do
+		s=${s//"${BASH_REMATCH[0]}"/}
+	done
+	printf '%s' "$s"
+}
+
 # Да/нет: y или n
 ask_yn() {
 	local var=$1 text=$2 def=$3
 	local rc=0
+	text=$(wt_clean "$text")
 	if [[ $def == n ]]; then
 		whiptail --title "$WHIPTAIL_TITLE" --defaultno --yesno "$text" 14 78 3>&1 1>&2 2>&3 || rc=$?
 	else
@@ -100,6 +126,7 @@ ask_yn() {
 ask_num() {
 	local var=$1 text=$2 min=$3 max=$4 def=$5
 	local val=$def rc=0
+	text=$(wt_clean "$text")
 	while :; do
 		rc=0
 		val=$(whiptail --title "$WHIPTAIL_TITLE" --inputbox "$text" 12 78 "$val" 3>&1 1>&2 2>&3) || rc=$?
@@ -120,6 +147,7 @@ Enter a number from $min to $max" 10 78 3>&1 1>&2 2>&3 || true
 ask_menu() {
 	local var=$1 text=$2 def=$3
 	shift 3
+	text=$(wt_clean "$text")
 	local out rc=0
 	out=$(whiptail --title "$WHIPTAIL_TITLE" --menu "$text" 24 78 12 --default-item "$def" "$@" 3>&1 1>&2 2>&3) || rc=$?
 	if [[ $rc -ne 0 ]]; then
@@ -132,6 +160,7 @@ ask_menu() {
 # Строка: необязательный regex и необязательная проверка домена через getent
 ask_text() {
 	local var=$1 text=$2 def=$3 regex=${4:-} mode=${5:-}
+	text=$(wt_clean "$text")
 	local val=$def rc=0
 	while :; do
 		rc=0
@@ -292,7 +321,7 @@ Turn on OpenVPN DCO? [y/n]:' y
 	ask_yn WARP_PROTECTION $'Warning! WARP protection blocks \001\e[1;32m\002AntiZapret VPN\001\e[0m\002 and \001\e[1;32m\002full VPN\001\e[0m\002 traffic if WARP failed to connect!\n\nEnable WARP protection? [y/n]:' y
 	ask_text WARP_ENDPOINT 'Custom Cloudflare WARP endpoint (host:port):
 Enter empty to set default endpoint' "$WARP_ENDPOINT_DEFAULT" '^([^:]+:[0-9]+)?$'
-	ask_menu ANTIZAPRET_DNS $'Choose DNS resolvers for \001\e[1;32m\002AntiZapret VPN\001\e[0m\002 (antizapret-*):\nDNS choice [1-6]:\n\n  * - DNS resolvers support EDNS Client Subnet\n ** - Enable additional proxying and hide this server IP on some internet resources' 1 \
+	ask_menu ANTIZAPRET_DNS $'Choose DNS resolvers for \001\e[1;32m\002AntiZapret VPN\001\e[0m\002 (antizapret-*):\nDNS choice [1-6]:\n\n  * - DNS resolvers support EDNS Client Subnet\n ** - Enable additional proxying and hide this server IP on some internet resources\n     Use only if this server is geolocated in Russia or problems\n     accessing some internet resources' 1 \
 		1 'MSK-IX+NSDI      - DNS resolvers optimized for users located in Russia, recommended by default (+BI.ZONE +TransTeleCom +Cloudflare +Quad9 +ControlD +UltraDNS)' \
 		2 'Cloudflare+Quad9  - Use if default choice fails to resolve domains (+ControlD +UltraDNS)' \
 		3 'Yandex *         - Use if previous choice fails to resolve domains' \
