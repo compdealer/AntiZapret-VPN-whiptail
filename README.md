@@ -5,6 +5,21 @@
 
 Скрипт для установки на [своём сервере](#где-купить-сервер) AntiZapret VPN и обычного VPN, работает по протоколам OpenVPN (есть патч для обхода блокировки), WireGuard и AmneziaWG
 
+> **Этот репозиторий — форк с whiptail-UI.**
+> Вопросы установки (`setup.sh`) задаются в полноэкранных диалогах whiptail, а не текстовыми подсказками:
+> те же 39 вопросов, тот же порядок, те же формулировки и значения по умолчанию, что в апстриме.
+> Логика установки не менялась; при отсутствии whiptail, без терминала или с `NO_WHIPTAIL=1`
+> скрипт работает как в апстриме — текстовыми вопросами.
+>
+> Установка (Ubuntu 24.04 / Debian 13, под root, в живом терминале):
+> ```
+> bash <(wget -qO- --no-hsts --inet4-only https://raw.githubusercontent.com/compdealer/AntiZapret-VPN-whiptail/whiptail-ui/setup.sh)
+> ```
+> Закреплённая версия: `.../146de970/setup.sh` вместо `.../whiptail-ui/setup.sh`
+> (не изменится, если ветку перезапишут).
+>
+> Подробности, спецификация и журнал — [docs/whiptail/](docs/whiptail/) в ветке `whiptail-ui`.
+
 AntiZapret VPN реализует технологию [раздельного туннелирования](https://encyclopedia.kaspersky.ru/glossary/split-tunneling)
 
 Через AntiZapret VPN (файлы antizapret-\*) работают только определенные сайты и IP-адреса:
