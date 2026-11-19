@@ -18,6 +18,145 @@ handle_error() {
 }
 trap 'handle_error $? $LINENO "$BASH_COMMAND"' ERR
 
+# Лог установки: апстрим лог не ведёт, а версию whiptail нужно писать в файл
+LOG=${LOG:-/tmp/antizapret-setup.log}
+
+# QUESTIONS_ONLY=1 — только вопросы: система не меняется, блок setup печатается в stdout
+QUESTIONS_ONLY=${QUESTIONS_ONLY:-0}
+
+# 1) выбор интерфейса. Приоритет: AZ_UI -> NO_WHIPTAIL -> нет TTY -> вопрос.
+#    Вопрос задаётся обычным read -rp: whiptail здесь использовать нельзя.
+ui_explicit=0
+if [[ -n ${AZ_UI:-} ]]; then
+	ui_explicit=1
+elif [[ ${NO_WHIPTAIL:-0} == 1 ]]; then
+	AZ_UI=plain
+elif [[ ! -t 0 ]]; then
+	AZ_UI=plain
+	echo "stdin is not a terminal: using plain prompts"
+else
+	while :; do
+		read -rp 'Interface: 1) whiptail TUI  2) plain prompts [1]: ' ui_choice || ui_choice=1
+		case ${ui_choice:-1} in
+			1) AZ_UI=whiptail; break ;;
+			2) AZ_UI=plain; break ;;
+			*) echo "Invalid choice: ${ui_choice}" ;;
+		esac
+	done
+fi
+case $AZ_UI in
+	whiptail|plain) ;;
+	*) echo "AZ_UI must be whiptail or plain"; exit 2 ;;
+esac
+
+# 2) режим whiptail: бинарь, TTY, TERM. Пакет ставим только в этой ветке.
+if [[ $AZ_UI == whiptail ]]; then
+	WHIPTAIL_BIN=$(command -v whiptail || true)
+	if [[ -z $WHIPTAIL_BIN && ${QUESTIONS_ONLY:-0} != 1 ]]; then
+		apt-get install -y whiptail || true
+		WHIPTAIL_BIN=$(command -v whiptail || true)
+	fi
+	if [[ -z $WHIPTAIL_BIN ]]; then
+		# явный AZ_UI=whiptail молча не подменяем
+		if [[ $ui_explicit == 1 ]]; then
+			echo "AZ_UI=whiptail but whiptail is not installed"
+			exit 2
+		fi
+		echo "whiptail not available, falling back to plain prompts"
+		AZ_UI=plain
+	elif [[ $ui_explicit == 0 && ( ! -t 0 || -z ${TERM:-} ) ]]; then
+		echo "whiptail not available, falling back to plain prompts"
+		AZ_UI=plain
+	fi
+	if [[ $AZ_UI == whiptail ]]; then
+		whiptail --version 2>&1 | head -1 >> "$LOG"
+	fi
+fi
+
+# 3) хелперы диалогов: ответ приходит по fd 3 (3>&1 1>&2 2>&3), а каждый вызов
+#    стоит в if/|| — иначе set -e убил бы установщик на Cancel (1) и ESC (255).
+WHIPTAIL_TITLE='AntiZapret VPN setup'
+
+# Да/нет: y или n
+ask_yn() {
+	local var=$1 text=$2 def=$3
+	local rc=0
+	if [[ $def == n ]]; then
+		whiptail --title "$WHIPTAIL_TITLE" --defaultno --yesno "$text" 14 78 3>&1 1>&2 2>&3 || rc=$?
+	else
+		whiptail --title "$WHIPTAIL_TITLE" --yesno "$text" 14 78 3>&1 1>&2 2>&3 || rc=$?
+	fi
+	if [[ $rc -eq 0 ]]; then
+		printf -v "$var" '%s' y
+	elif [[ $rc -eq 1 ]]; then
+		printf -v "$var" '%s' n
+	else
+		echo "Cancelled" >&2
+		exit 1
+	fi
+}
+
+# Число в диапазоне: неверный ввод -> msgbox с ошибкой и тот же диалог
+ask_num() {
+	local var=$1 text=$2 min=$3 max=$4 def=$5
+	local val=$def rc=0
+	while :; do
+		rc=0
+		val=$(whiptail --title "$WHIPTAIL_TITLE" --inputbox "$text" 12 78 "$val" 3>&1 1>&2 2>&3) || rc=$?
+		if [[ $rc -ne 0 ]]; then
+			echo "Cancelled" >&2
+			exit 1
+		fi
+		if [[ $val =~ ^[0-9]+$ ]] && (( val >= min && val <= max )); then
+			break
+		fi
+		whiptail --title "$WHIPTAIL_TITLE" --msgbox "Invalid value: $val
+Enter a number from $min to $max" 10 78 3>&1 1>&2 2>&3 || true
+	done
+	printf -v "$var" '%s' "$val"
+}
+
+# Меню: возвращает тег (номер пункта), а не текст пункта
+ask_menu() {
+	local var=$1 text=$2 def=$3
+	shift 3
+	local out rc=0
+	out=$(whiptail --title "$WHIPTAIL_TITLE" --menu "$text" 24 78 12 --default-item "$def" "$@" 3>&1 1>&2 2>&3) || rc=$?
+	if [[ $rc -ne 0 ]]; then
+		echo "Cancelled" >&2
+		exit 1
+	fi
+	printf -v "$var" '%s' "$out"
+}
+
+# Строка: необязательный regex и необязательная проверка домена через getent
+ask_text() {
+	local var=$1 text=$2 def=$3 regex=${4:-} mode=${5:-}
+	local val=$def rc=0
+	while :; do
+		rc=0
+		val=$(whiptail --title "$WHIPTAIL_TITLE" --inputbox "$text" 12 78 "$val" 3>&1 1>&2 2>&3) || rc=$?
+		if [[ $rc -ne 0 ]]; then
+			echo "Cancelled" >&2
+			exit 1
+		fi
+		if [[ -n $regex && ! $val =~ $regex ]]; then
+			whiptail --title "$WHIPTAIL_TITLE" --msgbox "Invalid value: $val" 10 78 3>&1 1>&2 2>&3 || true
+			continue
+		fi
+		if [[ $mode == host && -n $val ]]; then
+			if [[ -z $(getent ahostsv4 "$val") ]]; then
+				whiptail --title "$WHIPTAIL_TITLE" --msgbox "Invalid domain name: $val" 10 78 3>&1 1>&2 2>&3 || true
+				continue
+			fi
+		fi
+		break
+	done
+	printf -v "$var" '%s' "$val"
+}
+
+# В режиме QUESTIONS_ONLY системная преамбула целиком пропускается
+if [[ $QUESTIONS_ONLY != 1 ]]; then
 # Проверка необходимости перезагрузить
 if [[ -f /var/run/reboot-required ]] || pidof apt apt-get dpkg unattended-upgrades &>/dev/null; then
 	echo 'Error: You need to reboot this server before installation!'
@@ -112,8 +251,88 @@ done
 MTU=$((DEFAULT_MTU - 60))
 (( MTU > 1420 )) && MTU=1420
 (( MTU < 1280 )) && MTU=1280
+else
+	# Система не меняется: берём рекомендуемые значения MTU по умолчанию
+	DEFAULT_MTU=1420
+	MTU=$((DEFAULT_MTU - 60))
+fi
 
 # Спрашиваем о настройках
+# Случайный endpoint считается ОДИН раз: в plain-ветке он нужен для -i, в whiptail — как дефолт
+WARP_ENDPOINT_DEFAULT="162.159.192.$((RANDOM % 254 + 1)):500"
+
+# В whiptail-режиме вопросы задаются диалогами, порядок/тексты/дефолты как в апстриме
+if [[ $AZ_UI == whiptail ]]; then
+	ask_num MTU "Detected server path MTU: $DEFAULT_MTU
+Recommended OpenVPN/WireGuard/WARP path MTU is $MTU
+
+OpenVPN/WireGuard path MTU [1280-1420]:" 1280 1420 "$MTU"
+	ask_num WARP_MTU 'Cloudflare WARP path MTU [1280-1420]:' 1280 1420 "$MTU"
+	ask_yn OPENVPN_UDP_ENABLE 'Enable OpenVPN UDP? [y/n]:' y
+	ask_yn OPENVPN_TCP_ENABLE 'Enable OpenVPN TCP? [y/n]:' n
+	ask_yn WIREGUARD_ENABLE 'Enable WireGuard/AmneziaWG? [y/n]:' y
+	ask_menu OPENVPN_PATCH 'Choose anti-censorship patch for OpenVPN (UDP only):
+Version choice [1-4]:' 2 \
+		1 'None        - Do not install anti-censorship patch, or remove if already installed' \
+		2 'Random      - Recommended by default, randomly selects Strong or Error-Free' \
+		3 'Strong      - Better protocol masking' \
+		4 'Error-Free  - Use if Strong patch causes connection error, recommended for routers'
+	ask_yn OPENVPN_DCO 'OpenVPN DCO lowers CPU load, boosts data speeds, and only supports AES-128-GCM, AES-256-GCM and CHACHA20-POLY1305 encryption
+
+Turn on OpenVPN DCO? [y/n]:' y
+	ask_menu ANTIZAPRET_WARP $'Choose Cloudflare WARP for \001\e[1;32m\002AntiZapret VPN\001\e[0m\002 (antizapret-*) outbound traffic:\nWARP choice [1-4]:' 4 \
+		1 'None    - Do not use' \
+		2 'All     - Route all AntiZapret VPN traffic (domains and IPs)' \
+		3 'Domain  - Route AntiZapret domains and config/include-warp-hosts.txt, excluding config/exclude-warp-hosts.txt' \
+		4 'Custom  - Route domains only from config/include-warp-hosts.txt, excluding config/exclude-warp-hosts.txt'
+	ask_menu VPN_WARP $'Choose Cloudflare WARP for \001\e[1;32m\002full VPN\001\e[0m\002 (vpn-*) outbound traffic:\nWARP choice [1-3]:' 2 \
+		1 'None    - Do not use' \
+		2 'All     - Route all full VPN traffic (domains and IPs)' \
+		3 'Custom  - Route domains only from config/include-warp-hosts.txt, excluding config/exclude-warp-hosts.txt'
+	ask_yn WARP_PROTECTION $'Warning! WARP protection blocks \001\e[1;32m\002AntiZapret VPN\001\e[0m\002 and \001\e[1;32m\002full VPN\001\e[0m\002 traffic if WARP failed to connect!\n\nEnable WARP protection? [y/n]:' y
+	ask_text WARP_ENDPOINT 'Custom Cloudflare WARP endpoint (host:port):
+Enter empty to set default endpoint' "$WARP_ENDPOINT_DEFAULT" '^([^:]+:[0-9]+)?$'
+	ask_menu ANTIZAPRET_DNS $'Choose DNS resolvers for \001\e[1;32m\002AntiZapret VPN\001\e[0m\002 (antizapret-*):\nDNS choice [1-6]:\n\n  * - DNS resolvers support EDNS Client Subnet\n ** - Enable additional proxying and hide this server IP on some internet resources' 1 \
+		1 'MSK-IX+NSDI      - DNS resolvers optimized for users located in Russia, recommended by default (+BI.ZONE +TransTeleCom +Cloudflare +Quad9 +ControlD +UltraDNS)' \
+		2 'Cloudflare+Quad9  - Use if default choice fails to resolve domains (+ControlD +UltraDNS)' \
+		3 'Yandex *         - Use if previous choice fails to resolve domains' \
+		4 'Google *         - Use if previous choice fails to resolve domains' \
+		5 'AdGuard *        - Use for blocking ads, trackers, malware and phishing websites' \
+		6 'GeoHide **       - More details: https://geohide.ru'
+	ask_menu VPN_DNS $'Choose DNS resolvers for \001\e[1;32m\002full VPN\001\e[0m\002 (vpn-*):\nDNS choice [1-2]:' 1 \
+		1 'Self-hosted        - Use previous choice for AntiZapret VPN, recommended by default' \
+		2 'Cloudflare/Custom  - Disables replacement answer from self-hosted DNS, allows custom DNS'
+	ask_yn DNS_WARP $'Answer "y" if selected DNS resolvers are blocked or unreachable\n\nRoute all DNS outbound queries via Cloudflare WARP? [y/n]:' n
+	ask_yn ANTIZAPRET_ADBLOCK $'Enable blocking ads, trackers, malware and phishing websites in \001\e[1;32m\002AntiZapret VPN\001\e[0m\002 (antizapret-*) based on AdGuard and OISD rules? [y/n]:' y
+	ask_yn VPN_ADBLOCK $'Enable blocking ads, trackers, malware and phishing websites in \001\e[1;32m\002full VPN\001\e[0m\002 (vpn-*) based on AdGuard and OISD rules? [y/n]:' n
+	ask_yn ALTERNATIVE_CLIENT_IP $'Default CLIENT IP address range:     10.28.0.0/15\nAlternative CLIENT IP address range: 172.28.0.0/15\n\nUse alternative CLIENT IP address range? [y/n]:' n
+	if [[ $ALTERNATIVE_CLIENT_IP == 'y' ]]; then IP=172; else IP=10; fi
+	ask_yn ALTERNATIVE_FAKE_IP "Default FAKE IP address range:     $IP.30.0.0/15
+Alternative FAKE IP address range: 198.18.0.0/15
+
+Use alternative range of FAKE IP addresses? [y/n]:" y
+	ask_yn OPENVPN_BACKUP_UDP 'Use UDP ports 80, 443, 504, 508 as backup for OpenVPN connections? [y/n]:' y
+	ask_yn OPENVPN_BACKUP_TCP 'Use TCP ports 80, 443, 504, 508 as backup for OpenVPN connections? [y/n]:' n
+	ask_yn WIREGUARD_BACKUP 'Use UDP ports 540, 580 as backup for WireGuard/AmneziaWG connections? [y/n]:' y
+	ask_yn OPENVPN_DUPLICATE 'Allow multiple clients connecting to OpenVPN using same profile file (*.ovpn)? [y/n]:' y
+	ask_yn OPENVPN_LOG 'Enable detailed logs and status in OpenVPN? [y/n]:' n
+	ask_yn SSH_PROTECTION $'Warning! SSH protection may block your IP after 5 logins/minute!\n\nEnable SSH brute-force protection? [y/n]:' y
+	ask_yn ATTACK_PROTECTION $'Warning! Attack protection may block VPN or third-party applications!\n\nEnable network attack protection? [y/n]:' y
+	ask_yn SCAN_PROTECTION $'Warning! Scan protection blocks ping and closed-port replies!\n\nEnable network scan protection? [y/n]:' y
+	ask_yn FLOOD_PROTECTION $'Warning! Flood protection limits new connections and DNS queries per VPN client!\n\nEnable VPN client flood protection? [y/n]:' y
+	ask_yn TORRENT_GUARD $'Warning! Torrent guard blocks VPN traffic for 1 minute on torrent detection!\n\nEnable torrent guard for \001\e[1;32m\002full VPN\001\e[0m\002? [y/n]:' y
+	ask_yn RESTRICT_FORWARD $'Restrict forwarding in \001\e[1;32m\002AntiZapret VPN\001\e[0m\002 to IPs from config/forward-ips.txt and result/route-ips.txt? [y/n]:' y
+	ask_yn CLIENT_ISOLATION $'Enable \001\e[1;32m\002all VPN\001\e[0m\002 client and server isolation? [y/n]:' y
+	ask_text OPENVPN_HOST 'Enter valid domain name for this OpenVPN server or press Enter to skip:' '' '' host
+	ask_text WIREGUARD_HOST 'Enter valid domain name for this WireGuard/AmneziaWG server or press Enter to skip:' '' '' host
+	ask_yn RECONNECT_WARP 'Reconnect all WARP connections after parse.sh/doall.sh and every night? [y/n]:' y
+	ask_yn CLEAR_DNS_CACHE 'Clear Knot Resolver DNS cache after parse.sh/doall.sh and every night? [y/n]:' y
+	ask_yn CLEAR_HOSTS $'Remove spam domains (casino, bookmaker, etc) from \001\e[1;32m\002AntiZapret VPN\001\e[0m\002? [y/n]:' y
+	ask_yn ROUTE_ALL $'Route all domains via \001\e[1;32m\002AntiZapret VPN\001\e[0m\002, excluding Russian domains and config/exclude-hosts.txt? [y/n]:' n
+	ask_yn CLOUDFLARE_INCLUDE $'Include Cloudflare IPs in \001\e[1;32m\002AntiZapret VPN\001\e[0m\002? [y/n]:' y
+	ask_yn TELEGRAM_INCLUDE $'Include Telegram IPs in \001\e[1;32m\002AntiZapret VPN\001\e[0m\002? [y/n]:' y
+	ask_yn WHATSAPP_INCLUDE $'Include WhatsApp IPs in \001\e[1;32m\002AntiZapret VPN\001\e[0m\002? [y/n]:' y
+else
 echo "Detected server path MTU: $DEFAULT_MTU"
 echo "Recommended OpenVPN/WireGuard/WARP path MTU is $MTU"
 echo
@@ -175,9 +394,9 @@ until [[ "$WARP_PROTECTION" =~ (y|n) ]]; do
 done
 echo
 echo 'Enter empty to set default endpoint'
-read -rp 'Custom Cloudflare WARP endpoint (host:port): ' -e -i "162.159.192.$((RANDOM % 254 + 1)):500" WARP_ENDPOINT
+read -rp 'Custom Cloudflare WARP endpoint (host:port): ' -e -i "$WARP_ENDPOINT_DEFAULT" WARP_ENDPOINT
 until [[ -z "$WARP_ENDPOINT" || "$WARP_ENDPOINT" =~ ^[^:]+:[0-9]+$ ]]; do
-	read -rp 'Custom Cloudflare WARP endpoint (host:port): ' -e -i "162.159.192.$((RANDOM % 254 + 1)):500" WARP_ENDPOINT
+	read -rp 'Custom Cloudflare WARP endpoint (host:port): ' -e -i "$WARP_ENDPOINT_DEFAULT" WARP_ENDPOINT
 done
 echo
 echo -e 'Choose DNS resolvers for \e[1;32mAntiZapret VPN\e[0m (antizapret-*):'
@@ -356,6 +575,94 @@ echo
 #	read -rp $'Include Akamai IPs in \001\e[1;32m\002AntiZapret VPN\001\e[0m\002? [y/n]: ' -e -i n AKAMAI_INCLUDE
 #done
 #echo
+fi
+
+# Единый writer файла настроек: из него берут и предпросмотр, и сама установка
+write_setup_file() {
+	cat <<SETUP_EOF
+SETUP_DATE=$(date --iso-8601=seconds)
+MTU=$MTU
+WARP_MTU=$WARP_MTU
+OPENVPN_UDP_ENABLE=$OPENVPN_UDP_ENABLE
+OPENVPN_TCP_ENABLE=$OPENVPN_TCP_ENABLE
+WIREGUARD_ENABLE=$WIREGUARD_ENABLE
+OPENVPN_PATCH=$OPENVPN_PATCH
+OPENVPN_DCO=$OPENVPN_DCO
+ANTIZAPRET_WARP=$ANTIZAPRET_WARP
+ANTIZAPRET_WARP_PRIVATE_KEY=
+ANTIZAPRET_WARP_PUBLIC_KEY=
+ANTIZAPRET_WARP_ENDPOINT=
+ANTIZAPRET_WARP_ADDRESS=
+VPN_WARP=$VPN_WARP
+VPN_WARP_PRIVATE_KEY=
+VPN_WARP_PUBLIC_KEY=
+VPN_WARP_ENDPOINT=
+VPN_WARP_ADDRESS=
+DNS_WARP=$DNS_WARP
+DNS_WARP_PRIVATE_KEY=
+DNS_WARP_PUBLIC_KEY=
+DNS_WARP_ENDPOINT=
+DNS_WARP_ADDRESS=
+WARP_ENDPOINT=$WARP_ENDPOINT
+WARP_PROTECTION=$WARP_PROTECTION
+ANTIZAPRET_DNS=$ANTIZAPRET_DNS
+VPN_DNS=$VPN_DNS
+ANTIZAPRET_ADBLOCK=$ANTIZAPRET_ADBLOCK
+VPN_ADBLOCK=$VPN_ADBLOCK
+ALTERNATIVE_CLIENT_IP=$ALTERNATIVE_CLIENT_IP
+ALTERNATIVE_FAKE_IP=$ALTERNATIVE_FAKE_IP
+OPENVPN_BACKUP_UDP=$OPENVPN_BACKUP_UDP
+OPENVPN_BACKUP_TCP=$OPENVPN_BACKUP_TCP
+WIREGUARD_BACKUP=$WIREGUARD_BACKUP
+OPENVPN_DUPLICATE=$OPENVPN_DUPLICATE
+OPENVPN_LOG=$OPENVPN_LOG
+SSH_PROTECTION=$SSH_PROTECTION
+ATTACK_PROTECTION=$ATTACK_PROTECTION
+SCAN_PROTECTION=$SCAN_PROTECTION
+FLOOD_PROTECTION=$FLOOD_PROTECTION
+TORRENT_GUARD=$TORRENT_GUARD
+RESTRICT_FORWARD=$RESTRICT_FORWARD
+CLIENT_ISOLATION=$CLIENT_ISOLATION
+OPENVPN_HOST=$OPENVPN_HOST
+WIREGUARD_HOST=$WIREGUARD_HOST
+RECONNECT_WARP=$RECONNECT_WARP
+CLEAR_DNS_CACHE=$CLEAR_DNS_CACHE
+CLEAR_HOSTS=$CLEAR_HOSTS
+ROUTE_ALL=$ROUTE_ALL
+DISCORD_INCLUDE=$DISCORD_INCLUDE
+CLOUDFLARE_INCLUDE=$CLOUDFLARE_INCLUDE
+TELEGRAM_INCLUDE=$TELEGRAM_INCLUDE
+WHATSAPP_INCLUDE=$WHATSAPP_INCLUDE
+ROBLOX_INCLUDE=$ROBLOX_INCLUDE
+AMAZON_INCLUDE=$AMAZON_INCLUDE
+HETZNER_INCLUDE=$HETZNER_INCLUDE
+DIGITALOCEAN_INCLUDE=$DIGITALOCEAN_INCLUDE
+OVH_INCLUDE=$OVH_INCLUDE
+GOOGLE_INCLUDE=$GOOGLE_INCLUDE
+AKAMAI_INCLUDE=$AKAMAI_INCLUDE
+DEFAULT_INTERFACE=
+DEFAULT_IP=
+ANTIZAPRET_OUT_INTERFACE=
+ANTIZAPRET_OUT_IP=
+VPN_OUT_INTERFACE=
+VPN_OUT_IP=
+CLIENT_IP=
+FAKE_IP=
+SETUP_EOF
+}
+
+if [[ $QUESTIONS_ONLY == 1 ]]; then
+	write_setup_file
+	exit 0
+fi
+
+if [[ $AZ_UI == whiptail ]]; then
+	SETUP_PREVIEW=$(mktemp)
+	trap 'rm -f "$SETUP_PREVIEW"' EXIT
+	write_setup_file > "$SETUP_PREVIEW"
+	whiptail --title "$WHIPTAIL_TITLE" --textbox "$SETUP_PREVIEW" 24 78 3>&1 1>&2 2>&3 || true
+	whiptail --title "$WHIPTAIL_TITLE" --yesno 'Proceed with installation?' 10 60 3>&1 1>&2 2>&3 || exit 1
+fi
 echo 'Installation, please wait...'
 
 # Остановим и выключим обновляемые службы
