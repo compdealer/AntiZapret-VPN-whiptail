@@ -19,6 +19,9 @@ unchanged; only the input layer is replaced. Logic after the questions (installa
 - `AZ_UI=whiptail|plain` forces the interface; without it the script asks a plain-text question first,
   because whiptail cannot be used before checking it exists.
 - `NO_WHIPTAIL=1` or a non-terminal stdin always falls back to the original plain prompts.
+- Colour scheme: the newt palette `NEWT_COLORS` is set to the Orange theme
+  (`cp737.net/blog/whiptail-orange-theme`) only when the user has not set the variable; plain mode
+  and `QUESTIONS_ONLY` are unaffected.
 - `QUESTIONS_ONLY=1` prints the resulting `setup` file (68 lines, upstream format) and exits before
   any system change: same answers in, same file out.
 - `SSH_PROTECTION=n` is answered by the operator; the UI does not read the previous `setup` file

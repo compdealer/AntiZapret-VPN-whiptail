@@ -77,6 +77,12 @@ fi
 #    стоит в if/|| — иначе set -e убил бы установщик на Cancel (1) и ESC (255).
 WHIPTAIL_TITLE='AntiZapret VPN setup'
 
+# Палитра newt для whiptail: схема Orange (cp737.net/blog/whiptail-orange-theme).
+# Подменяем только если NEWT_COLORS не задана пользователем; plain-режим не трогаем.
+if [[ $AZ_UI == whiptail && -z ${NEWT_COLORS:-} ]]; then
+	export NEWT_COLORS='root=white,black:border=brown,black:window=lightgray,black:shadow=gray,black:title=yellow,black:button=yellow,brown:actbutton=white,brown:compactbutton=brown,black:checkbox=lightgray,black:actcheckbox=yellow,brown:entry=yellow,brown:disentry=gray,brown:label=white,black:listbox=gray,black:actlistbox=black,brown:sellistbox=lightgray,green:actsellistbox=white,brown:textbox=white,black:acttextbox=black,cyan:emptyscale=,gray:fullscale=,brown:helpline=white,black:roottext=lightgray,black'
+fi
+
 # Терминал не умеет рисовать: явный AZ_UI -> код 2, выбранный в диалоге -> plain
 if [[ $AZ_UI == whiptail ]]; then
 	if ! whiptail --infobox '' 8 40 3>&1 1>&2 2>&3 2>/dev/null; then
